@@ -1,0 +1,47 @@
+name: import-zyc-20251002
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: 1. 从上游抓取 zyc 分支快照 (90657f2)
+        run: |
+          set -euo pipefail
+          git init -q /tmp/src
+          cd /tmp/src
+          git remote add upstream https://github.com/ApartTUSITU/kernel_xiaomi_sm8250_mod.git
+          git fetch -q --depth=1 upstream 90657f20409c64c3fdfeb808905dee8f47b06d53
+          git checkout -q FETCH_HEAD
+          echo "commit: $(git rev-parse HEAD)"
+          echo "tree  : $(git rev-parse 'HEAD^{tree}')"
+          git log -1 --format='date : %ci%nmsg  : %s'
+          echo "files: $(git ls-files | wc -l)"
+          du -sh /tmp/src
+          echo "--- 工作流目录 ---"
+          ls /tmp/src/.github/workflows/
+
+      - name: 2. 打包为快照提交并推送到本私有仓库
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SRC=/tmp/src
+          TREE=$(git -C $SRC rev-parse 'HEAD^{tree}')
+          mkdir -p /tmp/snap && cd /tmp/snap
+          (cd $SRC && git archive HEAD) | tar -x
+          git init -q -b android16-aptusitu-zyc .
+          git config user.email "import-bot@users.noreply.github.com"
+          git config user.name "import-bot"
+          git add -A
+          git commit -q -m "Import upstream branch android16-aptusitu-zyc @ 90657f20409c64c3fdfeb808905dee8f47b06d53 (dagu KSU kernel, built 2025-10-02 19:04 CST) -- upstream tree: $TREE"
+          git push -f "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/android16-aptusitu-zyc
+          echo "✅ 推送完成"
