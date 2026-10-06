@@ -1,0 +1,287 @@
+diff --git a/drivers/input/touchscreen/hxchipset/himax_common.c b/drivers/input/touchscreen/hxchipset/himax_common.c
+index bae201608e07e..ec8b52e580397 100644
+--- a/drivers/input/touchscreen/hxchipset/himax_common.c
++++ b/drivers/input/touchscreen/hxchipset/himax_common.c
+@@ -1937,31 +1937,44 @@ static int himax_power_supply_event(struct notifier_block *nb,
+ #endif
+ 
+ #if defined(HX_PEN_DETECT_GLOBAL)
+-static void himax_pen_supply_work(struct work_struct *work)
++int himax_get_pen_mode(void)
+ {
+-	int ret=0;
+-	int pen_connect_flag = xiaomi_touch_interfaces.touch_mode[Touch_Pen_ENABLE][GET_CUR_VALUE];
+-
+-		mutex_lock(&private_ts->pen_supply_lock);
+-		if(bTouchIsAwake){
+-			if(private_ts->pen_exist != private_ts->pen_is_charge || private_ts->pen_exist == -1){
+-				private_ts->pen_exist=private_ts->pen_is_charge;
+-				if(pen_connect_flag == 1){
+-					ret=g_core_fp.fp_pen_charge_mode_set(private_ts->pen_is_charge);
+-				}else{
+-					I("Bluetooth is not connected to the stylus, skip the magnetic attraction logic\n");
+-				}
+-				if(ret<0)
+-					E("pen charge mode set fail!!%d\n");
+-			}
+-		}
+-		mutex_unlock(&private_ts->pen_supply_lock);
+-		return;
++	return READ_ONCE(xiaomi_touch_interfaces.touch_mode[Touch_Pen_ENABLE][GET_CUR_VALUE]);
++}
++
++static bool himax_pen_mode_enabled(int pen_mode)
++{
++	return pen_mode == 1 || pen_mode == 17 || pen_mode == 18;
+ }
+ 
++static void himax_pen_supply_work(struct work_struct *work)
++{
++	int ret;
++	int pen_mode;
++	int charge_state;
++
++	mutex_lock(&private_ts->pen_supply_lock);
++	if (!bTouchIsAwake)
++		goto out;
++
++	pen_mode = xiaomi_touch_interfaces.touch_mode[Touch_Pen_ENABLE][GET_CUR_VALUE];
++	charge_state = READ_ONCE(private_ts->pen_is_charge);
++	if (!himax_pen_mode_enabled(pen_mode) ||
++	    private_ts->pen_exist == charge_state)
++		goto out;
++
++	ret = g_core_fp.fp_pen_charge_mode_set(charge_state);
++	if (ret < 0)
++		E("pen charge mode set failed, ret=%d\n", ret);
++	else
++		private_ts->pen_exist = charge_state;
++out:
++	mutex_unlock(&private_ts->pen_supply_lock);
++}
++
+ static int himax_pen_supply_notifier_callback(struct notifier_block *self, unsigned long event, void *data)
+ {
+-	private_ts->pen_is_charge = event;
++	WRITE_ONCE(private_ts->pen_is_charge, event);
+ 	schedule_work(&private_ts->pen_supply_change_work);
+ 	return 0;
+ }
+@@ -3453,6 +3466,14 @@ static void update_touchfeature_value_work(struct work_struct *work) {
+ 			return;
+ 		}
+ 		xiaomi_touch_interfaces.touch_mode[mode_type[i]][GET_CUR_VALUE] = temp_set_value;
++#if defined(HX_PEN_DETECT_GLOBAL)
++		if (mode_type[i] == Touch_Pen_ENABLE) {
++			mutex_lock(&private_ts->pen_supply_lock);
++			private_ts->pen_exist = -1;
++			mutex_unlock(&private_ts->pen_supply_lock);
++			schedule_work(&private_ts->pen_supply_change_work);
++		}
++#endif
+ 		I("set mode:%d = %d\n", mode_type[i], temp_set_value);
+ 	}
+ 
+@@ -3583,6 +3604,13 @@ int himax_chip_common_init(void)
+ 	struct himax_ts_data *ts = private_ts;
+ 	struct himax_platform_data *pdata;
+ 
++#if defined(HX_PEN_DETECT_GLOBAL)
++	mutex_init(&ts->pen_supply_lock);
++	ts->pen_is_charge = 0;
++	ts->pen_exist = -1;
++	INIT_WORK(&ts->pen_supply_change_work, himax_pen_supply_work);
++#endif
++
+ 	I("Prepare kernel fp\n");
+ 	kp_getname_kernel = (void *)kallsyms_lookup_name("getname_kernel");
+ 	if (!kp_getname_kernel) {
+@@ -3859,10 +3887,6 @@ int himax_chip_common_init(void)
+ #endif
+ 
+ #if defined(HX_PEN_DETECT_GLOBAL)
+-	ts->pen_is_charge = 0;
+-	ts->pen_exist= -1;
+-	mutex_init(&ts->pen_supply_lock);
+-	INIT_WORK(&ts->pen_supply_change_work, himax_pen_supply_work);
+ 	ts->pen_supply_notifier.notifier_call = himax_pen_supply_notifier_callback;
+ 	ret = pen_charge_state_notifier_register_client(&ts->pen_supply_notifier);
+ 	if (ret) {
+@@ -4174,10 +4198,6 @@ int himax_chip_common_resume(struct himax_ts_data *ts)
+ private_ts->usb_exist = -1;
+ queue_work(private_ts ->event_wq, &private_ts ->himax_supply_work);
+ 
+-/*tp anti pen charge interference*/
+-private_ts->pen_exist = -1;
+-schedule_work(&private_ts->pen_supply_change_work);
+-
+ /*gesture mode*/
+ if(private_ts->gesture_command_delayed >=0){
+ 	private_ts->db_wakeup = private_ts->gesture_command_delayed;
+@@ -4192,6 +4212,13 @@ bTouchIsAwake = 1;
+ 	I("reload the tp mode cmd");
+ 	himax_tp_mode_recovery();
+ #endif
++#if defined(HX_PEN_DETECT_GLOBAL)
++	/* Reapply charge mode after resume restored the touch-feature pen mode. */
++	mutex_lock(&private_ts->pen_supply_lock);
++	private_ts->pen_exist = -1;
++	mutex_unlock(&private_ts->pen_supply_lock);
++	schedule_work(&private_ts->pen_supply_change_work);
++#endif
+ END:
+ 	I("%s: END\n", __func__);
+ 	return 0;
+diff --git a/drivers/input/touchscreen/hxchipset/himax_common.h b/drivers/input/touchscreen/hxchipset/himax_common.h
+index e63247bf7d6db..b872ac3676acd 100644
+--- a/drivers/input/touchscreen/hxchipset/himax_common.h
++++ b/drivers/input/touchscreen/hxchipset/himax_common.h
+@@ -552,6 +552,10 @@ extern struct file * (*kp_file_open_name)(struct filename *name,
+ 			int flags, umode_t mode);
+ 
+ struct himax_core_fp;
++#if defined(HX_PEN_DETECT_GLOBAL)
++int himax_get_pen_mode(void);
++#endif
++
+ extern struct himax_core_fp g_core_fp;
+ extern struct himax_ts_data *private_ts;
+ extern struct himax_ic_data *ic_data;
+diff --git a/drivers/input/touchscreen/hxchipset/himax_ic_core.h b/drivers/input/touchscreen/hxchipset/himax_ic_core.h
+index 9f8d1ecc457d9..bfcdf4b200c30 100644
+--- a/drivers/input/touchscreen/hxchipset/himax_ic_core.h
++++ b/drivers/input/touchscreen/hxchipset/himax_ic_core.h
+@@ -497,6 +497,7 @@ enum bin_desc_map_table {
+ 
+ #if defined(HX_PEN_SWITCH)
+ 	#define pen_mode_touchfunc_addr		0x10007410
++	#define pen_type_addr			0x10007414
+ 	#define pen_mode_restriction_addr	0x10007FDC
+ #endif
+ 
+diff --git a/drivers/input/touchscreen/hxchipset/himax_ic_incell_core.c b/drivers/input/touchscreen/hxchipset/himax_ic_incell_core.c
+index a96783b7a1a2c..8255de06008f4 100644
+--- a/drivers/input/touchscreen/hxchipset/himax_ic_incell_core.c
++++ b/drivers/input/touchscreen/hxchipset/himax_ic_incell_core.c
+@@ -1181,11 +1181,51 @@ static int himax_touch_handwriting_mode(uint8_t enable)
+ 
+ }
+ 
++/* The V2 report format is shared by both pen generations.  The controller
++ * also needs its generation-specific scan profile selected independently.
++ */
++static int himax_set_pen_type(uint8_t pen_type)
++{
++	uint8_t tmp_addr[DATA_LEN_4];
++	uint8_t tmp_data[DATA_LEN_4] = {0x8A, 0xA8, 0x8A, 0xA8};
++	uint8_t readback[DATA_LEN_4];
++	int ret = -EIO;
++	int retry;
++
++	if (pen_type != 1 && pen_type != 2)
++		return -EINVAL;
++	if (pen_type == 1)
++		memset(tmp_data, 0, sizeof(tmp_data));
++
++	himax_parse_assign_cmd(pen_type_addr, tmp_addr, DATA_LEN_4);
++	for (retry = 0; retry < 3; retry++) {
++		ret = g_core_fp.fp_register_write(tmp_addr, tmp_data, DATA_LEN_4);
++		if (ret < 0)
++			continue;
++
++		/* Match the controller settling time used by the stock driver. */
++		msleep(30);
++		ret = g_core_fp.fp_register_read(tmp_addr, readback, DATA_LEN_4);
++		if (ret < 0)
++			continue;
++		if (!memcmp(tmp_data, readback, DATA_LEN_4))
++			return 0;
++		ret = -EIO;
++	}
++
++	E("%s: failed to select pen type %u, ret=%d\n",
++	  __func__, pen_type, ret);
++	return ret;
++}
++
+ static int himax_set_pen_mode(uint8_t pen_mode)
+ {
+ 	uint8_t tmp_addr[DATA_LEN_4];
+ 	uint8_t tmp_data[DATA_LEN_4] = {0x8A,0xA8,0x8A,0xA8};
+ 	int ret = 0;
++	int type_ret = 0;
++	int restriction_ret = 0;
++	int touchfunc_ret = 0;
+ 	char *envp[2];
+ 
+ 	I("%s:  enter \n", __func__);
+@@ -1194,13 +1234,23 @@ static int himax_set_pen_mode(uint8_t pen_mode)
+ 	kobject_uevent_env(&private_ts->dev->kobj, KOBJ_CHANGE, envp);
+ 	sysfs_notify(&private_ts->dev->kobj, NULL, "pen_connect_strategy");
+ 
+-	pen_mode = (pen_mode == 18 || pen_mode == 17 || pen_mode == 1) ? 1 : 0; // Fix third-party pen support on pipa
++	/* 0x11/0x12 carry the connected pen generation, not just enable. */
++	if (pen_mode == 1 || pen_mode == 17 || pen_mode == 18) {
++		type_ret = himax_set_pen_type(pen_mode == 18 ? 2 : 1);
++		pen_mode = 1;
++	} else {
++		pen_mode = 0;
++	}
+ 	if(pen_mode == 1)
+ 		memset(tmp_data,0,DATA_LEN_4);
+ 
+-	ret=himax_touch_handwriting_mode(pen_mode);
++	restriction_ret = himax_touch_handwriting_mode(pen_mode);
+ 	himax_parse_assign_cmd(pen_mode_touchfunc_addr,tmp_addr,DATA_LEN_4);
+-	ret = g_core_fp.fp_register_write(tmp_addr,tmp_data, DATA_LEN_4);
++	touchfunc_ret = g_core_fp.fp_register_write(tmp_addr, tmp_data, DATA_LEN_4);
++	ret = restriction_ret < 0 ? restriction_ret : touchfunc_ret;
++	/* A failed readback must not prevent enabling an otherwise usable pen. */
++	if (type_ret < 0)
++		ret = type_ret;
+ 
+ 	I("%s: pen mode switch is %d\n", __func__,pen_mode);
+ 	return ret;
+@@ -1214,6 +1264,8 @@ static int himax_pen_charge_detect_func(int enable)
+ 	uint8_t tmp_data[DATA_LEN_4] = {0x5A,0xA5,0x5A,0xA5};
+ 
+ 	int ret = 0;
++	int mode_ret = 0;
++	int charge_ret = 0;
+ 	char *envp[2];
+ 
+ 	I("%s:  enter \n", __func__);
+@@ -1224,10 +1276,15 @@ static int himax_pen_charge_detect_func(int enable)
+ 	if(enable == 0)
+ 		memset(tmp_data,0,DATA_LEN_4);
+ 
+-	ret=himax_set_pen_mode(!enable);
++	/* Keep the generation carried by Touch_Pen_ENABLE when undocking.
++	 * Passing only !enable would silently restore the first-generation type.
++	 */
++	mode_ret = himax_set_pen_mode(enable ? 0 :
++		himax_get_pen_mode());
+ 
+ 	himax_parse_assign_cmd(pen_charge_detect_addr,tmp_addr,DATA_LEN_4);
+-	ret = g_core_fp.fp_register_write(tmp_addr,tmp_data, DATA_LEN_4);
++	charge_ret = g_core_fp.fp_register_write(tmp_addr, tmp_data, DATA_LEN_4);
++	ret = mode_ret < 0 ? mode_ret : charge_ret;
+ 
+ 	I("%s: pen charge detect state is %d\n", __func__,enable);
+ 	return ret;
+@@ -1269,7 +1326,14 @@ static int himax_touchfeature_set(uint8_t *touchfeature)
+ 			ret=himax_set_gesture_mode(touchfeature[1]);
+ 			break;
+ 		case Touch_Pen_ENABLE:
+-			ret=himax_set_pen_mode(touchfeature[1]);
++#if defined(HX_PEN_DETECT_GLOBAL)
++			/* Serialize profile readback with magnetic charge-mode writes. */
++			mutex_lock(&private_ts->pen_supply_lock);
++#endif
++			ret = himax_set_pen_mode(touchfeature[1]);
++#if defined(HX_PEN_DETECT_GLOBAL)
++			mutex_unlock(&private_ts->pen_supply_lock);
++#endif
+ 			break;
+ 		default:
+ 			E("%s, not support this type\n", __func__);
